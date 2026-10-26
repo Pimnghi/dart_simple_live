@@ -1,5 +1,5 @@
 
-name: Build Windows
+name: Build Windows MSIX
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  build-windows:
+  build-msix:
     runs-on: windows-2022
 
     steps:
@@ -21,9 +21,6 @@ jobs:
           flutter-version: '3.38.x'
           cache: true
 
-      - name: Enable Windows desktop
-        run: flutter config --enable-windows-desktop
-
       - name: Get dependencies
         working-directory: simple_live_app
         run: flutter pub get
@@ -32,34 +29,96 @@ jobs:
         working-directory: simple_live_app
         run: flutter build windows --release
 
-      - name: Package Windows application
+      - name: Create and sign MSIX
+        working-directory: simple_live_app
         shell: pwsh
         run: |
-          $releaseDir = @(
-            "simple_live_app/build/windows/x64/runner/Release",
-            "simple_live_app/build/windows/runner/Release"
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $ErrorActionPreference = 'Stop'
 
-          if (-not $releaseDir) {
-            throw "Flutter Windows Release directory not found."
+          # 从 pubspec.yaml 读取主版本号，
+          # 使用 GitHub Actions 运行编号作为第四段版本号。
+          $pubspec = Get-Content pubspec.yaml -Raw
+          $m = [regex]::Match(
+            $pubspec,
+            '(?m)^version:[ \t]*(\d+)\.(\d+)\.(\d+)(?:\+\d+)?[ \t]*$'
+          )
+
+          if (-not $m.Success) {
+            throw "Could not read version from pubspec.yaml"
           }
 
-          New-Item -ItemType Directory `
-            -Path "package/SimpleLive" -Force | Out-Null
+          $msixVersion = "{0}.{1}.{2}.{3}" -f `
+            $m.Groups[1].Value, `
+            $m.Groups[2].Value, `
+            $m.Groups[3].Value, `
+            $env:GITHUB_RUN_NUMBER
 
-          Copy-Item -Path "$releaseDir/*" `
-            -Destination "package/SimpleLive" `
-            -Recurse -Force
+          Write-Host "MSIX version: $msixVersion"
 
-          Compress-Archive `
-            -Path "package/SimpleLive" `
-            -DestinationPath "simple-live-windows-x64.zip" `
-            -Force
+          # 为本次构建生成独立的代码签名证书。
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject "CN=Pimnghi.SimpleLive" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -KeyAlgorithm RSA `
+            -KeyLength 2048 `
+            -KeyExportPolicy Exportable `
+            -NotAfter (Get-Date).AddYears(2)
 
-      - name: Upload Windows artifact
+          $pfxPath = Join-Path `
+            $env:RUNNER_TEMP "simple-live-signing.pfx"
+
+          $pfxPasswordText = "ci-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $pfxPassword = ConvertTo-SecureString `
+            $pfxPasswordText -AsPlainText -Force
+
+          Export-PfxCertificate `
+            -Cert $cert `
+            -FilePath $pfxPath `
+            -Password $pfxPassword | Out-Null
+
+          # 确定 Flutter Release 输出目录。
+          $releaseDir = "build/windows/x64/runner/Release"
+
+          if (-not (Test-Path $releaseDir)) {
+            throw "Windows Release directory not found: $releaseDir"
+          }
+
+          # 生成 MSIX。证书私钥只用于本次云端构建，
+          # 不会作为下载产物上传。
+          dart run msix:create `
+            --version $msixVersion `
+            --certificate-path $pfxPath `
+            --certificate-password $pfxPasswordText `
+            --publisher "CN=Pimnghi.SimpleLive" `
+            --install-certificate false
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSIX creation failed"
+          }
+
+          # 导出公用证书，供安装 MSIX 前建立信任。
+          $cerPath = Join-Path `
+            $releaseDir "simple-live-signing.cer"
+
+          Export-Certificate `
+            -Cert $cert `
+            -FilePath $cerPath `
+            -Force | Out-Null
+
+          $msixPath = Join-Path `
+            $releaseDir "simple-live-windows-x64.msix"
+
+          if (-not (Test-Path $msixPath)) {
+            throw "MSIX file not found: $msixPath"
+          }
+
+      - name: Upload MSIX and certificate
         uses: actions/upload-artifact@v7
         with:
-          name: simple-live-windows-x64
-          path: simple-live-windows-x64.zip
+          name: simple-live-windows-msix
+          path: |
+            simple_live_app/build/windows/x64/runner/Release/simple-live-windows-x64.msix
+            simple_live_app/build/windows/x64/runner/Release/simple-live-signing.cer
           if-no-files-found: error
           retention-days: 14
