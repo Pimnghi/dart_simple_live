@@ -1,0 +1,65 @@
+
+name: Build Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.x'
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Get dependencies
+        working-directory: simple_live_app
+        run: flutter pub get
+
+      - name: Build Windows release
+        working-directory: simple_live_app
+        run: flutter build windows --release
+
+      - name: Package Windows application
+        shell: pwsh
+        run: |
+          $releaseDir = @(
+            "simple_live_app/build/windows/x64/runner/Release",
+            "simple_live_app/build/windows/runner/Release"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+          if (-not $releaseDir) {
+            throw "Flutter Windows Release directory not found."
+          }
+
+          New-Item -ItemType Directory `
+            -Path "package/SimpleLive" -Force | Out-Null
+
+          Copy-Item -Path "$releaseDir/*" `
+            -Destination "package/SimpleLive" `
+            -Recurse -Force
+
+          Compress-Archive `
+            -Path "package/SimpleLive" `
+            -DestinationPath "simple-live-windows-x64.zip" `
+            -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: simple-live-windows-x64
+          path: simple-live-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
